@@ -4,6 +4,8 @@ cli mínima pra renomear, aposentar ou ressignificar seu morto (e/ou nome antigo
 
 você mudou seu nome e agora ele tá espalhado em uma penca de lugar pela internet (ou arquivos no computador)? `mortis` te ajuda procurar pelo seu antigo nome, achar ocorrências e deixa você revisar uma a uma caso queira removê-las/editá-las.
 
+![gopher rebirthing](./mascot.png)
+
 ## como funciona
 
 1. clona os repos que você passar
@@ -42,8 +44,7 @@ mortis -from '(?i)nome[ _-]?antigo' -to "Nome Novo" -repos zoedsoupe/taina,zoeds
 
 ## o que o mortis não faz
 
-- não reescreve histórico do git (autoria de commits antigos continua lá, pra isso existe `git-filter-repo`)
-- não abre PR nem lida com fork (ainda)
+- não lida com issues, nem comentários em PRs (ainda)
 
 ## licença
 
