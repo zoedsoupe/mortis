@@ -1,16 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"charm.land/huh/v2"
@@ -64,9 +65,14 @@ func main() {
 		log.Fatalln(err)
 	}
 
+	union, err := maybeRegex(unionPattern(cfg.Subs))
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	fmt.Printf("clonando e buscando em %d repositórios...\n", len(cfg.Repos))
 
-	results := collect(cfg.Repos, unionPattern(cfg.Subs))
+	results := collect(cfg.Repos, union)
 
 	for _, res := range results {
 		defer os.RemoveAll(res.dir)
@@ -298,13 +304,13 @@ func validateRepos(fields []string) ([]string, error) {
 	return repos, nil
 }
 
-func collect(repos []string, pattern string) []repoResult {
+func collect(repos []string, re *regexp.Regexp) []repoResult {
 	results := make([]repoResult, len(repos))
 
 	var g errgroup.Group
 	for i, repo := range repos {
 		g.Go(func() error {
-			results[i] = searchRepo(repo, pattern)
+			results[i] = searchRepo(repo, re)
 			return nil
 		})
 	}
@@ -313,7 +319,7 @@ func collect(repos []string, pattern string) []repoResult {
 	return results
 }
 
-func searchRepo(repo, pattern string) repoResult {
+func searchRepo(repo string, re *regexp.Regexp) repoResult {
 	res := repoResult{repo: repo}
 
 	dir, err := os.MkdirTemp("", "mortis-*")
@@ -331,25 +337,15 @@ func searchRepo(repo, pattern string) repoResult {
 		return res
 	}
 
-	fmt.Printf("[%s] buscando %q...\n", repo, pattern)
-	grep := exec.Command("git", "grep", "-n", "-E", pattern)
-	grep.Dir = dir
-	out, err := grep.Output()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
-			fmt.Printf("[%s] nenhuma ocorrência\n", repo)
-			return res
-		}
-
-		res.err = fmt.Errorf("git grep: %w", err)
+	fmt.Printf("[%s] buscando...\n", repo)
+	res.matches, res.err = searchDir(dir, re)
+	if res.err != nil {
 		fmt.Printf("[%s] erro na busca: %v\n", repo, res.err)
 		return res
 	}
 
-	res.matches, res.err = parseGrep(string(out))
-	if res.err != nil {
-		fmt.Printf("[%s] erro ao ler resultado: %v\n", repo, res.err)
+	if len(res.matches) == 0 {
+		fmt.Printf("[%s] nenhuma ocorrência\n", repo)
 		return res
 	}
 
@@ -358,26 +354,45 @@ func searchRepo(repo, pattern string) repoResult {
 	return res
 }
 
-func parseGrep(output string) ([]match, error) {
+func searchDir(dir string, re *regexp.Regexp) ([]match, error) {
 	var matches []match
 
-	for line := range strings.Lines(output) {
-		line = strings.TrimSuffix(line, "\n")
-
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("linha de grep inesperada: %q", line)
-		}
-
-		n, err := strconv.Atoi(parts[1])
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil, fmt.Errorf("linha de grep inesperada: %q", line)
+			return err
 		}
 
-		matches = append(matches, match{file: parts[0], line: n, content: parts[2]})
-	}
+		if d.IsDir() {
+			if d.Name() == ".git" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 
-	return matches, nil
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		if bytes.IndexByte(content, 0) >= 0 {
+			return nil
+		}
+
+		rel, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+
+		for i, line := range strings.Split(string(content), "\n") {
+			if re.MatchString(line) {
+				matches = append(matches, match{file: rel, line: i + 1, content: line})
+			}
+		}
+
+		return nil
+	})
+
+	return matches, err
 }
 
 func apply(res repoResult, regexes []*regexp.Regexp, subs []substitution) error {

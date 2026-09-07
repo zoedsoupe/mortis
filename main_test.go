@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -43,31 +44,79 @@ func TestParseRepos(t *testing.T) {
 	})
 }
 
-func TestParseGrep(t *testing.T) {
-	t.Run("parses lines", func(t *testing.T) {
-		matches, err := parseGrep("a.go:10:foo: bar\nb.go:2:x\n")
+func TestSearchDir(t *testing.T) {
+	write := func(t *testing.T, dir, name string, content []byte) {
+		t.Helper()
+
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	re := regexp.MustCompile("carlos")
+
+	t.Run("finds matches with line numbers", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "a.txt", []byte("first\nhello carlos\nlast carlos line\n"))
+
+		matches, err := searchDir(dir, re)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want := []match{
+			{file: "a.txt", line: 2, content: "hello carlos"},
+			{file: "a.txt", line: 3, content: "last carlos line"},
+		}
+
+		if fmt.Sprint(matches) != fmt.Sprint(want) {
+			t.Fatalf("got %v", matches)
+		}
+	})
+
+	t.Run("skips .git directory", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, ".git/config", []byte("carlos"))
+
+		matches, err := searchDir(dir, re)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(matches) != 0 {
+			t.Fatalf("got %v", matches)
+		}
+	})
+
+	t.Run("skips binary files", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "bin.dat", []byte{'m', 'a', 't', 'h', 'e', 'u', 's', 0, 'x'})
+
+		matches, err := searchDir(dir, re)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(matches) != 0 {
+			t.Fatalf("got %v", matches)
+		}
+	})
+
+	t.Run("supports go-only regex syntax", func(t *testing.T) {
+		dir := t.TempDir()
+		write(t, dir, "a.txt", []byte("carlos\ncarlos\n"))
+
+		matches, err := searchDir(dir, regexp.MustCompile("(?i)carlos"))
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		if len(matches) != 2 {
 			t.Fatalf("got %v", matches)
-		}
-
-		if matches[0] != (match{file: "a.go", line: 10, content: "foo: bar"}) {
-			t.Fatalf("got %+v", matches[0])
-		}
-	})
-
-	t.Run("rejects malformed line", func(t *testing.T) {
-		if _, err := parseGrep("not-a-grep-line\n"); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-
-	t.Run("rejects bad line number", func(t *testing.T) {
-		if _, err := parseGrep("a.go:x:content\n"); err == nil {
-			t.Fatal("expected error")
 		}
 	})
 }
