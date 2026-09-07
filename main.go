@@ -6,11 +6,13 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"charm.land/huh/v2"
+	"charm.land/lipgloss/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -33,6 +35,11 @@ type repoResult struct {
 	err     error
 }
 
+var (
+	red   = lipgloss.NewStyle().Foreground(lipgloss.Red)
+	green = lipgloss.NewStyle().Foreground(lipgloss.Green)
+)
+
 func main() {
 	var cfg config
 
@@ -49,7 +56,11 @@ func main() {
 
 	results := collect(repos, cfg.dead)
 
-	fmt.Println("\nresultado:")
+	re, err := maybeRegex(cfg.dead)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
 	for _, res := range results {
 		defer os.RemoveAll(res.dir)
 
@@ -57,10 +68,32 @@ func main() {
 			continue
 		}
 
-		fmt.Printf("%s:\n", res.repo)
+		fmt.Printf("\n%s (%d ocorrências):\n", res.repo, len(res.matches))
 		for _, m := range res.matches {
-			fmt.Printf("  %s:%d: %s\n", m.file, m.line, m.content)
+			old := red.Render("- " + m.content)
+			new := green.Render("+ " + re.ReplaceAllString(m.content, cfg.alive))
+			fmt.Printf("  %s:%d\n  %s\n  %s\n", m.file, m.line, old, new)
 		}
+
+		var approve bool
+		confirm := huh.NewConfirm().
+			Title(fmt.Sprintf("aplicar alterações em %s?", res.repo)).
+			Value(&approve)
+		if err := confirm.Run(); err != nil {
+			log.Fatalln("deu ruim ao rodar o formulário")
+		}
+
+		if !approve {
+			fmt.Printf("[%s] pulado\n", res.repo)
+			continue
+		}
+
+		if err := apply(res, re, cfg.alive); err != nil {
+			fmt.Printf("[%s] erro ao aplicar: %v\n", res.repo, err)
+			continue
+		}
+
+		fmt.Printf("[%s] alterações aplicadas\n", res.repo)
 	}
 }
 
@@ -217,6 +250,8 @@ func parseGrep(output string) ([]match, error) {
 	var matches []match
 
 	for line := range strings.Lines(output) {
+		line = strings.TrimSuffix(line, "\n")
+
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 {
 			return nil, fmt.Errorf("linha de grep inesperada: %q", line)
@@ -231,4 +266,34 @@ func parseGrep(output string) ([]match, error) {
 	}
 
 	return matches, nil
+}
+
+func apply(res repoResult, re *regexp.Regexp, alive string) error {
+	seen := make(map[string]bool)
+
+	for _, m := range res.matches {
+		if seen[m.file] {
+			continue
+		}
+		seen[m.file] = true
+
+		path := filepath.Join(res.dir, m.file)
+
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", m.file, err)
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("%s: %w", m.file, err)
+		}
+
+		replaced := re.ReplaceAll(content, []byte(alive))
+		if err := os.WriteFile(path, replaced, info.Mode()); err != nil {
+			return fmt.Errorf("%s: %w", m.file, err)
+		}
+	}
+
+	return nil
 }
