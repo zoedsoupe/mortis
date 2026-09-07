@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -90,6 +91,109 @@ func TestMaybeRegex(t *testing.T) {
 	})
 }
 
+func TestLoadConfig(t *testing.T) {
+	t.Run("empty path returns zero config", func(t *testing.T) {
+		cfg, err := loadConfig("")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(cfg.Repos) != 0 || len(cfg.Subs) != 0 {
+			t.Fatalf("got %+v", cfg)
+		}
+	})
+
+	t.Run("parses json and dedupes repos", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		json := `{
+			"repos": ["a/b", "a/b", "c/d"],
+			"substitutions": [
+				{"dead": "carlos", "alive": "Zoey"},
+				{"dead": "carl0s_42", "alive": "zoedsoupe"}
+			]
+		}`
+		if err := os.WriteFile(path, []byte(json), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(cfg.Repos) != 2 {
+			t.Fatalf("got %v", cfg.Repos)
+		}
+
+		if len(cfg.Subs) != 2 || cfg.Subs[0].Dead != "carlos" {
+			t.Fatalf("got %+v", cfg.Subs)
+		}
+	})
+
+	t.Run("rejects invalid json", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte("{nope"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := loadConfig(path); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestCompileSubs(t *testing.T) {
+	t.Run("rejects empty", func(t *testing.T) {
+		if _, err := compileSubs(nil); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("rejects invalid regex", func(t *testing.T) {
+		if _, err := compileSubs([]substitution{{Dead: "(["}}); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestUnionPattern(t *testing.T) {
+	subs := []substitution{{Dead: "a+"}, {Dead: "b|c"}}
+
+	got := unionPattern(subs)
+	want := "(a+)|(b|c)"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestReplaceOrder(t *testing.T) {
+	subs := []substitution{
+		{Dead: "foo", Alive: "bar"},
+		{Dead: "bar", Alive: "baz"},
+	}
+
+	regexes, err := compileSubs(subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := replaceString("foo", regexes, subs)
+	if got != "baz" {
+		t.Fatalf("got %q, pairs must apply in order", got)
+	}
+}
+
+func compileOne(t *testing.T, dead string) []*regexp.Regexp {
+	t.Helper()
+
+	regexes, err := compileSubs([]substitution{{Dead: dead}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return regexes
+}
+
 func TestApply(t *testing.T) {
 	dir := t.TempDir()
 
@@ -105,12 +209,8 @@ func TestApply(t *testing.T) {
 		},
 	}
 
-	re, err := maybeRegex("carlos")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := apply(res, re, "zoey"); err != nil {
+	subs := []substitution{{Dead: "carlos", Alive: "zoey"}}
+	if err := apply(res, compileOne(t, "carlos"), subs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,12 +246,8 @@ func TestApplyCaptureGroup(t *testing.T) {
 		matches: []match{{file: "a.txt", line: 1, content: "old_name"}},
 	}
 
-	re, err := maybeRegex("old_(\\w+)")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := apply(res, re, "new_$1"); err != nil {
+	subs := []substitution{{Dead: "old_(\\w+)", Alive: "new_$1"}}
+	if err := apply(res, compileOne(t, "old_(\\w+)"), subs); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,5 +258,44 @@ func TestApplyCaptureGroup(t *testing.T) {
 
 	if string(got) != "new_name\n" {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestApplyMultiplePairs(t *testing.T) {
+	dir := t.TempDir()
+
+	content := "Copyright carlos <carlos@x.com> github.com/carl0s_42\n"
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := repoResult{
+		dir:     dir,
+		matches: []match{{file: "a.txt", line: 1, content: content}},
+	}
+
+	subs := []substitution{
+		{Dead: "carlos", Alive: "Zoey"},
+		{Dead: "carlos@x.com", Alive: "zoey@y.com"},
+		{Dead: "carl0s_42", Alive: "zoedsoupe"},
+	}
+
+	regexes, err := compileSubs(subs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := apply(res, regexes, subs); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := "Copyright Zoey <zoey@y.com> github.com/zoedsoupe\n"
+	if string(got) != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

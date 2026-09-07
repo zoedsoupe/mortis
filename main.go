@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -16,10 +18,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+type substitution struct {
+	Dead  string `json:"dead"`
+	Alive string `json:"alive"`
+}
+
 type config struct {
-	dead  string
-	alive string
-	repos string
+	Repos []string       `json:"repos"`
+	Subs  []substitution `json:"substitutions"`
 }
 
 type match struct {
@@ -41,25 +47,26 @@ var (
 )
 
 func main() {
-	var cfg config
+	configPath := flag.String("config", "", "arquivo de configuração JSON")
+	flag.Parse()
 
-	if err := buildForm(&cfg).Run(); err != nil {
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	if err := fillConfig(&cfg); err != nil {
 		log.Fatalln("deu ruim ao rodar o formulário")
 	}
 
-	repos, err := parseRepos(cfg.repos)
+	regexes, err := compileSubs(cfg.Subs)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	fmt.Printf("clonando e buscando em %d repositórios...\n", len(repos))
+	fmt.Printf("clonando e buscando em %d repositórios...\n", len(cfg.Repos))
 
-	results := collect(repos, cfg.dead)
-
-	re, err := maybeRegex(cfg.dead)
-	if err != nil {
-		log.Fatalln(err)
-	}
+	results := collect(cfg.Repos, unionPattern(cfg.Subs))
 
 	for _, res := range results {
 		defer os.RemoveAll(res.dir)
@@ -71,7 +78,7 @@ func main() {
 		fmt.Printf("\n%s (%d ocorrências):\n", res.repo, len(res.matches))
 		for _, m := range res.matches {
 			old := red.Render("- " + m.content)
-			new := green.Render("+ " + re.ReplaceAllString(m.content, cfg.alive))
+			new := green.Render("+ " + replaceString(m.content, regexes, cfg.Subs))
 			fmt.Printf("  %s:%d\n  %s\n  %s\n", m.file, m.line, old, new)
 		}
 
@@ -88,7 +95,7 @@ func main() {
 			continue
 		}
 
-		if err := apply(res, re, cfg.alive); err != nil {
+		if err := apply(res, regexes, cfg.Subs); err != nil {
 			fmt.Printf("[%s] erro ao aplicar: %v\n", res.repo, err)
 			continue
 		}
@@ -97,27 +104,80 @@ func main() {
 	}
 }
 
-func buildForm(cfg *config) *huh.Form {
-	return huh.NewForm(
-		huh.NewGroup(
-			huh.NewInput().
-				Title("nome morto/antigo").
-				Validate(validRegex).
-				Value(&cfg.dead).
-				Description("golang regex"),
-			huh.NewInput().
-				Title("nome correto").
-				Validate(required).
-				Value(&cfg.alive),
-		),
-		huh.NewGroup(
+func loadConfig(path string) (config, error) {
+	var cfg config
+
+	if path == "" {
+		return cfg, nil
+	}
+
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return cfg, err
+	}
+
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return cfg, fmt.Errorf("config inválida: %w", err)
+	}
+
+	repos, err := validateRepos(cfg.Repos)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Repos = repos
+
+	return cfg, nil
+}
+
+func fillConfig(cfg *config) error {
+	var groups []*huh.Group
+	var reposInput, deadInput, aliveInput string
+
+	if len(cfg.Repos) == 0 {
+		groups = append(groups, huh.NewGroup(
 			huh.NewInput().
 				Title("repositorios github").
 				Description("(formato: dono/nome,dono/nome2)").
 				Validate(validRepos).
-				Value(&cfg.repos),
-		),
-	)
+				Value(&reposInput),
+		))
+	}
+
+	if len(cfg.Subs) == 0 {
+		groups = append(groups, huh.NewGroup(
+			huh.NewInput().
+				Title("nome morto/antigo").
+				Validate(validRegex).
+				Value(&deadInput).
+				Description("golang regex"),
+			huh.NewInput().
+				Title("nome correto").
+				Validate(required).
+				Value(&aliveInput),
+		))
+	}
+
+	if len(groups) == 0 {
+		return nil
+	}
+
+	if err := huh.NewForm(groups...).Run(); err != nil {
+		return err
+	}
+
+	if len(cfg.Repos) == 0 {
+		repos, err := parseRepos(reposInput)
+		if err != nil {
+			return err
+		}
+		cfg.Repos = repos
+	}
+
+	if len(cfg.Subs) == 0 {
+		cfg.Subs = []substitution{{Dead: deadInput, Alive: aliveInput}}
+	}
+
+	return nil
 }
 
 func required(str string) error {
@@ -159,11 +219,67 @@ func maybeRegex(str string) (*regexp.Regexp, error) {
 	return r, nil
 }
 
+func compileSubs(subs []substitution) ([]*regexp.Regexp, error) {
+	if len(subs) == 0 {
+		return nil, errors.New("nenhuma substituição informada")
+	}
+
+	regexes := make([]*regexp.Regexp, len(subs))
+	for i, s := range subs {
+		re, err := maybeRegex(s.Dead)
+		if err != nil {
+			return nil, fmt.Errorf("substituição %d (%q): regex inválida: %w", i, s.Dead, err)
+		}
+		regexes[i] = re
+	}
+
+	return regexes, nil
+}
+
+func unionPattern(subs []substitution) string {
+	parts := make([]string, len(subs))
+	for i, s := range subs {
+		parts[i] = "(" + s.Dead + ")"
+	}
+
+	return strings.Join(parts, "|")
+}
+
+func replaceBytes(content []byte, regexes []*regexp.Regexp, subs []substitution) []byte {
+	for i, re := range regexes {
+		content = re.ReplaceAll(content, []byte(subs[i].Alive))
+	}
+
+	return content
+}
+
+func replaceString(str string, regexes []*regexp.Regexp, subs []substitution) string {
+	return string(replaceBytes([]byte(str), regexes, subs))
+}
+
 func parseRepos(input string) ([]string, error) {
+	var fields []string
+	for r := range strings.SplitSeq(input, ",") {
+		fields = append(fields, r)
+	}
+
+	repos, err := validateRepos(fields)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(repos) == 0 {
+		return nil, errors.New("nenhum repositório informado")
+	}
+
+	return repos, nil
+}
+
+func validateRepos(fields []string) ([]string, error) {
 	seen := make(map[string]bool)
 	var repos []string
 
-	for r := range strings.SplitSeq(input, ",") {
+	for _, r := range fields {
 		r = strings.TrimSpace(r)
 		if r == "" {
 			continue
@@ -177,10 +293,6 @@ func parseRepos(input string) ([]string, error) {
 			seen[r] = true
 			repos = append(repos, r)
 		}
-	}
-
-	if len(repos) == 0 {
-		return nil, errors.New("nenhum repositório informado")
 	}
 
 	return repos, nil
@@ -268,7 +380,7 @@ func parseGrep(output string) ([]match, error) {
 	return matches, nil
 }
 
-func apply(res repoResult, re *regexp.Regexp, alive string) error {
+func apply(res repoResult, regexes []*regexp.Regexp, subs []substitution) error {
 	seen := make(map[string]bool)
 
 	for _, m := range res.matches {
@@ -289,7 +401,7 @@ func apply(res repoResult, re *regexp.Regexp, alive string) error {
 			return fmt.Errorf("%s: %w", m.file, err)
 		}
 
-		replaced := re.ReplaceAll(content, []byte(alive))
+		replaced := replaceBytes(content, regexes, subs)
 		if err := os.WriteFile(path, replaced, info.Mode()); err != nil {
 			return fmt.Errorf("%s: %w", m.file, err)
 		}
