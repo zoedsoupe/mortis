@@ -1,46 +1,14 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"regexp"
-	"strings"
 
 	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
-	"golang.org/x/sync/errgroup"
 )
-
-type substitution struct {
-	Dead  string `json:"dead"`
-	Alive string `json:"alive"`
-}
-
-type config struct {
-	Repos []string       `json:"repos"`
-	Subs  []substitution `json:"substitutions"`
-}
-
-type match struct {
-	file    string
-	line    int
-	content string
-}
-
-type repoResult struct {
-	repo    string
-	dir     string
-	matches []match
-	err     error
-}
 
 var (
 	red   = lipgloss.NewStyle().Foreground(lipgloss.Red)
@@ -50,9 +18,12 @@ var (
 func main() {
 	configPath := flag.String("config", "", "arquivo de configuração JSON")
 	dryRun := flag.Bool("dry-run", false, "apenas busca, sem aplicar alterações")
-	dead := flag.String("dead", "", "regex do nome antigo")
-	alive := flag.String("alive", "", "nome novo")
+	reveal := flag.Bool("reveal", false, "mostra o nome antigo nas prévias (escondido por padrão)")
+	from := flag.String("from", "", "regex do nome antigo")
+	to := flag.String("to", "", "nome novo")
 	reposFlag := flag.String("repos", "", "repositórios github (formato: dono/nome,dono/nome2)")
+	urlsFlag := flag.String("urls", "", "repositórios git por URL, separados por vírgula")
+	pathsFlag := flag.String("paths", "", "arquivos ou pastas locais, separados por vírgula")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -69,24 +40,36 @@ func main() {
 		cfg.Repos = repos
 	}
 
-	if *dead != "" || *alive != "" {
-		if *dead == "" {
-			log.Fatalln("flag -alive requer -dead")
+	if *urlsFlag != "" {
+		cfg.URLs = parseList(*urlsFlag)
+	}
+
+	if *pathsFlag != "" {
+		cfg.Paths = parseList(*pathsFlag)
+	}
+
+	if *from != "" || *to != "" {
+		if *from == "" {
+			log.Fatalln("flag -to requer -from")
 		}
 
-		if *alive == "" && !*dryRun {
-			log.Fatalln("flag -dead requer -alive (exceto com -dry-run)")
+		if *to == "" && !*dryRun {
+			log.Fatalln("flag -from requer -to (exceto com -dry-run)")
 		}
 
-		if err := validRegex(*dead); err != nil {
+		if err := validRegex(*from); err != nil {
 			log.Fatalln(err)
 		}
 
-		cfg.Subs = []substitution{{Dead: *dead, Alive: *alive}}
+		cfg.Subs = []substitution{{From: *from, To: *to}}
 	}
 
 	if err := fillConfig(&cfg); err != nil {
 		log.Fatalln("deu ruim ao rodar o formulário")
+	}
+
+	if err := cfg.normalize(); err != nil {
+		log.Fatalln(err)
 	}
 
 	regexes, err := compileSubs(cfg.Subs)
@@ -99,27 +82,57 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	fmt.Printf("clonando e buscando em %d repositórios...\n", len(cfg.Repos))
+	sources, err := cfg.sources()
+	if err != nil {
+		log.Fatalln(err)
+	}
 
-	results := collect(cfg.Repos, union)
+	if len(sources) == 0 {
+		log.Fatalln("nenhuma fonte informada (repos, urls ou paths)")
+	}
 
+	fmt.Printf("buscando em %d fontes...\n", len(sources))
+
+	results := collect(sources, union)
+
+	warned := false
 	for _, res := range results {
-		defer os.RemoveAll(res.dir)
+		if res.tmp {
+			defer os.RemoveAll(res.dir)
+		}
 
-		if res.err != nil || len(res.matches) == 0 {
+		if res.err != nil {
+			fmt.Printf("[%s] erro: %v\n", res.name, res.err)
 			continue
 		}
 
-		fmt.Printf("\n%s (%d ocorrências):\n", res.repo, len(res.matches))
+		if len(res.matches) == 0 {
+			fmt.Printf("[%s] nenhuma ocorrência\n", res.name)
+			continue
+		}
+
+		if !warned {
+			fmt.Println("\n💜 aviso: as prévias escondem o nome antigo por padrão (use -reveal pra ver). vai no seu tempo.")
+			warned = true
+		}
+
+		fmt.Printf("\n%s (%d ocorrências):\n", res.name, len(res.matches))
 		for _, m := range res.matches {
+			old := m.content
+			if !*reveal {
+				old = maskLine(old, union)
+			}
+
 			if *dryRun {
-				fmt.Printf("  %s:%d: %s\n", m.file, m.line, m.content)
+				fmt.Printf("  %s:%d: %s\n", m.file, m.line, old)
 				continue
 			}
 
-			old := red.Render("- " + m.content)
-			new := green.Render("+ " + replaceString(m.content, regexes, cfg.Subs))
-			fmt.Printf("  %s:%d\n  %s\n  %s\n", m.file, m.line, old, new)
+			if *reveal {
+				old = red.Render(old)
+			}
+
+			fmt.Printf("  %s:%d\n  - %s\n  + %s\n", m.file, m.line, old, green.Render(replaceString(m.content, regexes, cfg.Subs)))
 		}
 
 		if *dryRun {
@@ -128,337 +141,22 @@ func main() {
 
 		var approve bool
 		confirm := huh.NewConfirm().
-			Title(fmt.Sprintf("aplicar alterações em %s?", res.repo)).
+			Title(fmt.Sprintf("aplicar alterações em %s?", res.name)).
 			Value(&approve)
 		if err := confirm.Run(); err != nil {
 			log.Fatalln("deu ruim ao rodar o formulário")
 		}
 
 		if !approve {
-			fmt.Printf("[%s] pulado\n", res.repo)
+			fmt.Printf("[%s] pulado\n", res.name)
 			continue
 		}
 
 		if err := apply(res, regexes, cfg.Subs); err != nil {
-			fmt.Printf("[%s] erro ao aplicar: %v\n", res.repo, err)
+			fmt.Printf("[%s] erro ao aplicar: %v\n", res.name, err)
 			continue
 		}
 
-		fmt.Printf("[%s] alterações aplicadas\n", res.repo)
+		fmt.Printf("[%s] alterações aplicadas\n", res.name)
 	}
-}
-
-func loadConfig(path string) (config, error) {
-	var cfg config
-
-	if path == "" {
-		return cfg, nil
-	}
-
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, err
-	}
-
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return cfg, fmt.Errorf("config inválida: %w", err)
-	}
-
-	repos, err := validateRepos(cfg.Repos)
-	if err != nil {
-		return cfg, err
-	}
-	cfg.Repos = repos
-
-	return cfg, nil
-}
-
-func fillConfig(cfg *config) error {
-	var groups []*huh.Group
-	var reposInput, deadInput, aliveInput string
-
-	if len(cfg.Repos) == 0 {
-		groups = append(groups, huh.NewGroup(
-			huh.NewInput().
-				Title("repositorios github").
-				Description("(formato: dono/nome,dono/nome2)").
-				Validate(validRepos).
-				Value(&reposInput),
-		))
-	}
-
-	if len(cfg.Subs) == 0 {
-		groups = append(groups, huh.NewGroup(
-			huh.NewInput().
-				Title("nome morto/antigo").
-				Validate(validRegex).
-				Value(&deadInput).
-				Description("golang regex"),
-			huh.NewInput().
-				Title("nome correto").
-				Validate(required).
-				Value(&aliveInput),
-		))
-	}
-
-	if len(groups) == 0 {
-		return nil
-	}
-
-	if err := huh.NewForm(groups...).Run(); err != nil {
-		return err
-	}
-
-	if len(cfg.Repos) == 0 {
-		repos, err := parseRepos(reposInput)
-		if err != nil {
-			return err
-		}
-		cfg.Repos = repos
-	}
-
-	if len(cfg.Subs) == 0 {
-		cfg.Subs = []substitution{{Dead: deadInput, Alive: aliveInput}}
-	}
-
-	return nil
-}
-
-func required(str string) error {
-	if len(str) < 1 {
-		return errors.New("precisa preencher esse campo!")
-	}
-
-	return nil
-}
-
-func validRegex(str string) error {
-	if err := required(str); err != nil {
-		return err
-	}
-
-	if _, err := maybeRegex(str); err != nil {
-		return fmt.Errorf("regex inválida: %w", err)
-	}
-
-	return nil
-}
-
-func validRepos(str string) error {
-	if err := required(str); err != nil {
-		return err
-	}
-
-	_, err := parseRepos(str)
-
-	return err
-}
-
-func maybeRegex(str string) (*regexp.Regexp, error) {
-	r, err := regexp.Compile(str)
-	if err != nil {
-		return nil, err
-	}
-
-	return r, nil
-}
-
-func compileSubs(subs []substitution) ([]*regexp.Regexp, error) {
-	if len(subs) == 0 {
-		return nil, errors.New("nenhuma substituição informada")
-	}
-
-	regexes := make([]*regexp.Regexp, len(subs))
-	for i, s := range subs {
-		re, err := maybeRegex(s.Dead)
-		if err != nil {
-			return nil, fmt.Errorf("substituição %d (%q): regex inválida: %w", i, s.Dead, err)
-		}
-		regexes[i] = re
-	}
-
-	return regexes, nil
-}
-
-func unionPattern(subs []substitution) string {
-	parts := make([]string, len(subs))
-	for i, s := range subs {
-		parts[i] = "(" + s.Dead + ")"
-	}
-
-	return strings.Join(parts, "|")
-}
-
-func replaceBytes(content []byte, regexes []*regexp.Regexp, subs []substitution) []byte {
-	for i, re := range regexes {
-		content = re.ReplaceAll(content, []byte(subs[i].Alive))
-	}
-
-	return content
-}
-
-func replaceString(str string, regexes []*regexp.Regexp, subs []substitution) string {
-	return string(replaceBytes([]byte(str), regexes, subs))
-}
-
-func parseRepos(input string) ([]string, error) {
-	var fields []string
-	for r := range strings.SplitSeq(input, ",") {
-		fields = append(fields, r)
-	}
-
-	repos, err := validateRepos(fields)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(repos) == 0 {
-		return nil, errors.New("nenhum repositório informado")
-	}
-
-	return repos, nil
-}
-
-func validateRepos(fields []string) ([]string, error) {
-	seen := make(map[string]bool)
-	var repos []string
-
-	for _, r := range fields {
-		r = strings.TrimSpace(r)
-		if r == "" {
-			continue
-		}
-
-		if !strings.Contains(r, "/") {
-			return nil, fmt.Errorf("repo %q inválido, formato esperado: dono/nome", r)
-		}
-
-		if !seen[r] {
-			seen[r] = true
-			repos = append(repos, r)
-		}
-	}
-
-	return repos, nil
-}
-
-func collect(repos []string, re *regexp.Regexp) []repoResult {
-	results := make([]repoResult, len(repos))
-
-	var g errgroup.Group
-	for i, repo := range repos {
-		g.Go(func() error {
-			results[i] = searchRepo(repo, re)
-			return nil
-		})
-	}
-	_ = g.Wait()
-
-	return results
-}
-
-func searchRepo(repo string, re *regexp.Regexp) repoResult {
-	res := repoResult{repo: repo}
-
-	dir, err := os.MkdirTemp("", "mortis-*")
-	if err != nil {
-		res.err = err
-		return res
-	}
-	res.dir = dir
-
-	fmt.Printf("[%s] clonando...\n", repo)
-	clone := exec.Command("git", "clone", "--depth", "1", "https://github.com/"+repo, dir)
-	if out, err := clone.CombinedOutput(); err != nil {
-		res.err = fmt.Errorf("clone: %w: %s", err, out)
-		fmt.Printf("[%s] erro no clone: %v\n", repo, res.err)
-		return res
-	}
-
-	fmt.Printf("[%s] buscando...\n", repo)
-	res.matches, res.err = searchDir(dir, re)
-	if res.err != nil {
-		fmt.Printf("[%s] erro na busca: %v\n", repo, res.err)
-		return res
-	}
-
-	if len(res.matches) == 0 {
-		fmt.Printf("[%s] nenhuma ocorrência\n", repo)
-		return res
-	}
-
-	fmt.Printf("[%s] %d ocorrências encontradas\n", repo, len(res.matches))
-
-	return res
-}
-
-func searchDir(dir string, re *regexp.Regexp) ([]match, error) {
-	var matches []match
-
-	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			if d.Name() == ".git" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-
-		if bytes.IndexByte(content, 0) >= 0 {
-			return nil
-		}
-
-		rel, err := filepath.Rel(dir, path)
-		if err != nil {
-			return err
-		}
-
-		for i, line := range strings.Split(string(content), "\n") {
-			if re.MatchString(line) {
-				matches = append(matches, match{file: rel, line: i + 1, content: line})
-			}
-		}
-
-		return nil
-	})
-
-	return matches, err
-}
-
-func apply(res repoResult, regexes []*regexp.Regexp, subs []substitution) error {
-	seen := make(map[string]bool)
-
-	for _, m := range res.matches {
-		if seen[m.file] {
-			continue
-		}
-		seen[m.file] = true
-
-		path := filepath.Join(res.dir, m.file)
-
-		info, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("%s: %w", m.file, err)
-		}
-
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return fmt.Errorf("%s: %w", m.file, err)
-		}
-
-		replaced := replaceBytes(content, regexes, subs)
-		if err := os.WriteFile(path, replaced, info.Mode()); err != nil {
-			return fmt.Errorf("%s: %w", m.file, err)
-		}
-	}
-
-	return nil
 }
