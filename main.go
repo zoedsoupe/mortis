@@ -105,7 +105,7 @@ func main() {
 			continue
 		}
 
-		if !(*reveal && warned) {
+		if !*reveal && !warned {
 			fmt.Println("\n💜 aviso: as prévias escondem o nome antigo por padrão (use -reveal pra ver). vai no seu tempo.")
 			warned = true
 		}
