@@ -19,8 +19,9 @@ func main() {
 	configPath := flag.String("config", "", "arquivo de configuração JSON")
 	dryRun := flag.Bool("dry-run", false, "apenas busca, sem aplicar alterações")
 	reveal := flag.Bool("reveal", false, "mostra o nome antigo nas prévias (escondido por padrão)")
-	from := flag.String("from", "", "regex do nome antigo")
-	to := flag.String("to", "", "nome novo")
+	var froms, tos strList
+	flag.Var(&froms, "from", "regex do nome antigo (repetível, pareado com -to)")
+	flag.Var(&tos, "to", "nome novo (repetível, pareado com -from)")
 	reposFlag := flag.String("repos", "", "repositórios github (formato: dono/nome,dono/nome2)")
 	urlsFlag := flag.String("urls", "", "repositórios git por URL, separados por vírgula")
 	pathsFlag := flag.String("paths", "", "arquivos ou pastas locais, separados por vírgula")
@@ -48,20 +49,13 @@ func main() {
 		cfg.Paths = parseList(*pathsFlag)
 	}
 
-	if *from != "" || *to != "" {
-		if *from == "" {
-			log.Fatalln("flag -to requer -from")
-		}
+	subs, err := subsFromFlags(froms, tos, *dryRun)
+	if err != nil {
+		log.Fatalln(err)
+	}
 
-		if *to == "" && !*dryRun {
-			log.Fatalln("flag -from requer -to (exceto com -dry-run)")
-		}
-
-		if err := validRegex(*from); err != nil {
-			log.Fatalln(err)
-		}
-
-		cfg.Subs = []substitution{{From: *from, To: *to}}
+	if subs != nil {
+		cfg.Subs = subs
 	}
 
 	if err := fillConfig(&cfg); err != nil {
@@ -111,7 +105,7 @@ func main() {
 			continue
 		}
 
-		if !warned {
+		if !(*reveal && warned) {
 			fmt.Println("\n💜 aviso: as prévias escondem o nome antigo por padrão (use -reveal pra ver). vai no seu tempo.")
 			warned = true
 		}

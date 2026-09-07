@@ -14,6 +14,47 @@ type substitution struct {
 	To   string `json:"to"`
 }
 
+// strList collects repeated flag occurrences, e.g. -from a -from b.
+type strList []string
+
+func (s *strList) String() string { return strings.Join(*s, ",") }
+
+func (s *strList) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
+// subsFromFlags pairs -from/-to flag values by index. With dryRun, -to may be omitted.
+func subsFromFlags(froms, tos []string, dryRun bool) ([]substitution, error) {
+	if len(froms) == 0 {
+		if len(tos) > 0 {
+			return nil, errors.New("flag -to requer -from")
+		}
+		return nil, nil
+	}
+
+	if len(tos) == 0 {
+		if !dryRun {
+			return nil, errors.New("flag -from requer -to (exceto com -dry-run)")
+		}
+	} else if len(tos) != len(froms) {
+		return nil, fmt.Errorf("-from e -to precisam aparecer na mesma quantidade (%d vs %d)", len(froms), len(tos))
+	}
+
+	subs := make([]substitution, len(froms))
+	for i, from := range froms {
+		if err := validRegex(from); err != nil {
+			return nil, err
+		}
+		subs[i].From = from
+		if len(tos) > 0 {
+			subs[i].To = tos[i]
+		}
+	}
+
+	return subs, nil
+}
+
 type config struct {
 	From  string         `json:"from"`
 	To    string         `json:"to"`

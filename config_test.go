@@ -148,6 +148,53 @@ func TestSources(t *testing.T) {
 	}
 }
 
+func TestSubsFromFlags(t *testing.T) {
+	t.Run("pairs by index", func(t *testing.T) {
+		subs, err := subsFromFlags([]string{"Carlos", "carl0s_42"}, []string{"Alice", "alice_dev"}, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(subs) != 2 || subs[1].From != "carl0s_42" || subs[1].To != "alice_dev" {
+			t.Fatalf("got %+v", subs)
+		}
+	})
+
+	t.Run("from alone requires dry-run", func(t *testing.T) {
+		if _, err := subsFromFlags([]string{"Carlos"}, nil, false); err == nil {
+			t.Fatal("expected error")
+		}
+
+		subs, err := subsFromFlags([]string{"Carlos"}, nil, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(subs) != 1 || subs[0].To != "" {
+			t.Fatalf("got %+v", subs)
+		}
+	})
+
+	t.Run("rejects mismatched counts", func(t *testing.T) {
+		if _, err := subsFromFlags([]string{"a", "b"}, []string{"x"}, false); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("to alone errors", func(t *testing.T) {
+		if _, err := subsFromFlags(nil, []string{"x"}, false); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("empty returns nil", func(t *testing.T) {
+		subs, err := subsFromFlags(nil, nil, false)
+		if err != nil || subs != nil {
+			t.Fatalf("got %+v, %v", subs, err)
+		}
+	})
+}
+
 func TestExpandPath(t *testing.T) {
 	home, err := os.UserHomeDir()
 	if err != nil {
