@@ -49,11 +49,40 @@ var (
 
 func main() {
 	configPath := flag.String("config", "", "arquivo de configuração JSON")
+	dryRun := flag.Bool("dry-run", false, "apenas busca, sem aplicar alterações")
+	dead := flag.String("dead", "", "regex do nome antigo")
+	alive := flag.String("alive", "", "nome novo")
+	reposFlag := flag.String("repos", "", "repositórios github (formato: dono/nome,dono/nome2)")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalln(err)
+	}
+
+	if *reposFlag != "" {
+		repos, err := parseRepos(*reposFlag)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		cfg.Repos = repos
+	}
+
+	if *dead != "" || *alive != "" {
+		if *dead == "" {
+			log.Fatalln("flag -alive requer -dead")
+		}
+
+		if *alive == "" && !*dryRun {
+			log.Fatalln("flag -dead requer -alive (exceto com -dry-run)")
+		}
+
+		if err := validRegex(*dead); err != nil {
+			log.Fatalln(err)
+		}
+
+		cfg.Subs = []substitution{{Dead: *dead, Alive: *alive}}
 	}
 
 	if err := fillConfig(&cfg); err != nil {
@@ -83,9 +112,18 @@ func main() {
 
 		fmt.Printf("\n%s (%d ocorrências):\n", res.repo, len(res.matches))
 		for _, m := range res.matches {
+			if *dryRun {
+				fmt.Printf("  %s:%d: %s\n", m.file, m.line, m.content)
+				continue
+			}
+
 			old := red.Render("- " + m.content)
 			new := green.Render("+ " + replaceString(m.content, regexes, cfg.Subs))
 			fmt.Printf("  %s:%d\n  %s\n  %s\n", m.file, m.line, old, new)
+		}
+
+		if *dryRun {
+			continue
 		}
 
 		var approve bool
